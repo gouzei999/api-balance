@@ -4,8 +4,11 @@
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3456;
+const ROOT = __dirname;
 
 // 允许代理的 API 域名
 const ALLOWED_HOSTS = [
@@ -16,6 +19,30 @@ const ALLOWED_HOSTS = [
   'openrouter.ai',
   'api.groq.com',
 ];
+
+// MIME types for static files
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+};
+
+function serveFile(relPath, res) {
+  const safe = path.normalize(relPath).replace(/^[/\\]+/, '').replace(/\.\.[/\\]/g, '');
+  const filePath = path.join(ROOT, safe);
+  const ext = path.extname(filePath);
+  const mime = MIME[ext] || 'application/octet-stream';
+  try {
+    const content = fs.readFileSync(filePath);
+    res.writeHead(200, { 'Content-Type': mime });
+    res.end(content);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+  }
+}
 
 const server = http.createServer((req, res) => {
   // CORS headers - 允许任何来源（仅限本地使用）
@@ -35,6 +62,14 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end('🟢 API余额代理运行中 · <a href="index.html">打开应用</a>');
     return;
+  }
+
+  // Static files (before /proxy check)
+  if (req.method === 'GET' && !req.url.startsWith('/proxy')) {
+    const urlPath = req.url.split('?')[0];
+    if (['/index.html', '/manifest.json', '/sw.js'].includes(urlPath) || urlPath.startsWith('/icons/')) {
+      return serveFile(urlPath, res);
+    }
   }
 
   // 解析目标 URL: /proxy?url=https://api.openai.com/v1/models
