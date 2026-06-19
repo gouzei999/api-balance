@@ -654,20 +654,18 @@ async function checkOpenAI(k, base) {
 }
 
 async function checkAnthropic(k, base) {
-  // Send a tiny message to check headers
-  const resp = await apiFetch(`${base}/messages`, {
-    method: 'POST',
+  // Use /models endpoint (free, no token cost) instead of sending a message
+  const resp = await apiFetch(`${base}/models?limit=1`, {
     headers: {
       'x-api-key': k.key,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1,
-      messages: [{ role: 'user', content: 'hi' }]
-    })
+      'anthropic-version': '2023-06-01'
+    }
   });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    return { status: 'error', error: `HTTP ${resp.status}: ${txt.slice(0,100)}`, checkedAt: Date.now() };
+  }
 
   const remaining = resp.headers.get('anthropic-ratelimit-requests-remaining');
   const limit = resp.headers.get('anthropic-ratelimit-requests-limit');
@@ -675,17 +673,21 @@ async function checkAnthropic(k, base) {
   const tokensRemaining = resp.headers.get('anthropic-ratelimit-tokens-remaining');
   const tokensLimit = resp.headers.get('anthropic-ratelimit-tokens-limit');
 
-  // Whether the request succeeded or rate-limited, we got header info
-  const isRateLimited = resp.status === 429;
+  let modelCount = 0;
+  try {
+    const data = await resp.json();
+    modelCount = data.data?.length || 0;
+  } catch(e) {}
 
   return {
     status: 'ok',
+    modelsAccessible: true,
+    modelCount,
     rateRemaining: remaining ? parseInt(remaining) : null,
     rateLimit: limit ? parseInt(limit) : null,
     rateReset: reset || null,
     tokensRemaining: tokensRemaining ? parseInt(tokensRemaining) : null,
     tokensLimit: tokensLimit ? parseInt(tokensLimit) : null,
-    isRateLimited,
     checkedAt: Date.now()
   };
 }
@@ -702,19 +704,27 @@ async function checkGoogle(k, base) {
 }
 
 async function checkDeepSeek(k, base) {
-  // DeepSeek has a balance endpoint
+  // DeepSeek has a balance endpoint: returns { is_available, balance_infos: [{ currency, total_balance, topped_up_balance, granted_balance }] }
   let balanceData = null;
+  let balanceError = null;
   try {
     const balResp = await apiFetch(`${base}/user/balance`, {
       headers: { 'Authorization': `Bearer ${k.key}` }
     });
     if (balResp.ok) {
       balanceData = await balResp.json();
+    } else if (balResp.status === 401 || balResp.status === 403) {
+      // Key is invalid
+      const txt = await balResp.text().catch(() => '');
+      return { status: 'error', error: `HTTP ${balResp.status}: 密钥无效`, checkedAt: Date.now() };
     }
-  } catch(e) {}
+  } catch(e) {
+    balanceError = e.message;
+  }
 
   // Also check models to verify key
   let modelCount = 0;
+  let modelsError = null;
   try {
     const mResp = await apiFetch(`${base}/models`, {
       headers: { 'Authorization': `Bearer ${k.key}` }
@@ -723,15 +733,29 @@ async function checkDeepSeek(k, base) {
       const mData = await mResp.json();
       modelCount = mData.data?.length || 0;
     }
-  } catch(e) {}
+  } catch(e) {
+    modelsError = e.message;
+  }
 
+  // If both calls failed with network/CORS errors, it's likely a CORS issue
+  if (!balanceData && modelCount === 0 && (balanceError || modelsError)) {
+    const errMsg = (balanceError || modelsError);
+    if (errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError') || errMsg.includes('Load failed')) {
+      return { status: 'error', error: proxyUrl ? '代理连接失败，检查代理是否运行' : 'CORS 限制，请在设置中配置代理后再试', checkedAt: Date.now() };
+    }
+    return { status: 'error', error: errMsg, checkedAt: Date.now() };
+  }
+
+  // DeepSeek balance response: { is_available, balance_infos: [{ total_balance, topped_up_balance, granted_balance }] }
+  const bi = balanceData?.balance_infos?.[0];
   return {
     status: 'ok',
-    balance: balanceData?.balance,
-    totalBalance: balanceData?.total_balance,
-    toppedUpBalance: balanceData?.topped_up_balance,
+    balance: bi?.total_balance ? Number(bi.total_balance) : undefined,
+    toppedUpBalance: bi?.topped_up_balance ? Number(bi.topped_up_balance) : undefined,
+    grantedBalance: bi?.granted_balance ? Number(bi.granted_balance) : undefined,
     isBalanceAvailable: balanceData?.is_available,
     modelCount,
+    balanceCorsBlocked: !!balanceError && !balanceData,
     checkedAt: Date.now()
   };
 }
@@ -866,12 +890,22 @@ function formatBalanceCard(k) {
       const c = Number(b.credits).toFixed(2);
       parts.push(`<div class="card-stat"><div class="num">$${c}</div><div class="label">余额</div></div>`);
     }
-    if (b.balance !== undefined) {
+    if (b.balance !== undefined && b.balance !== null) {
       const bal = Number(b.balance);
-      parts.push(`<div class="card-stat"><div class="num">¥${bal.toFixed(2)}</div><div class="label">余额</div></div>`);
+      parts.push(`<div class="card-stat"><div class="num">¥${bal.toFixed(2)}</div><div class="label">总余额</div></div>`);
     }
-    if (b.totalBalance !== undefined) {
+    if (b.toppedUpBalance !== undefined && b.toppedUpBalance !== null) {
+      parts.push(`<div class="card-stat"><div class="num">¥${Number(b.toppedUpBalance).toFixed(2)}</div><div class="label">充值余额</div></div>`);
+    }
+    if (b.grantedBalance !== undefined && b.grantedBalance !== null) {
+      parts.push(`<div class="card-stat"><div class="num">¥${Number(b.grantedBalance).toFixed(2)}</div><div class="label">赠送余额</div></div>`);
+    }
+    if (b.totalBalance !== undefined && b.totalBalance !== null) {
       parts.push(`<div class="card-stat"><div class="num">¥${Number(b.totalBalance).toFixed(2)}</div><div class="label">总充值</div></div>`);
+    }
+    // Warn if balance API was CORS-blocked but key is valid
+    if (b.balanceCorsBlocked) {
+      parts.push(`<div class="card-stat"><div class="num" style="color:var(--yellow);font-size:13px">⚠️</div><div class="label">余额接口 CORS 受限</div></div>`);
     }
     if (b.hardLimit !== undefined && b.hardLimit !== null) {
       parts.push(`<div class="card-stat"><div class="num">$${Number(b.hardLimit).toFixed(0)}</div><div class="label">硬上限</div></div>`);
